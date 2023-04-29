@@ -12,7 +12,6 @@ require 'open3'
 require 'up_for_grabs_tooling'
 
 def run(cmd)
-  warn "Running command: #{cmd}"
   stdout, stderr, status = Open3.capture3(cmd)
 
   {
@@ -22,23 +21,15 @@ def run(cmd)
   }
 end
 
-PREAMBLE_HEADER = '<!-- PULL REQUEST ANALYZER GITHUB ACTION -->'
+FOUND_PROJECT_FILES_HEADER = ":wave: I'm a robot checking the state of this pull request to save the human reviewers time. " \
+                             "I noticed this PR added or modififed the data files under `_data/projects/` so I had a look at what's changed." \
+                             "\n\nAs you make changes to this pull request, I'll re-run these checks.\n\n"
 
-GREETING_HEADER = ":wave: I'm a robot checking the state of this pull request to save the human reviewers time. " \
-                  "I noticed this PR added or modififed the data files under `_data/projects/` so I had a look at what's changed." \
-                  "\n\nAs you make changes to this pull request, I'll re-run these checks."
-
-UPDATE_HEADER = 'Checking the latest changes to the pull request...'
+SKIP_PULL_REQUEST_MESSAGE = ":wave: I'm a robot checking the state of this pull request to save the human reviewers time. " \
+                            "I don't see any changes under `_data/projects/` so I don't have any feedback here." \
+                            "\n\nAs you make changes to this pull request, I'll re-run these checks.\n\n"
 
 ALLOWED_EXTENSIONS = ['.yml'].freeze
-
-def get_header(initial_message)
-  if initial_message
-    GREETING_HEADER
-  else
-    UPDATE_HEADER
-  end
-end
 
 def get_validation_message(result)
   path = result[:project].relative_path
@@ -61,7 +52,7 @@ def get_validation_message(result)
   end
 end
 
-def generate_comment(dir, files, initial_message: true)
+def generate_review_comment(dir, files)
   projects = files.map do |f|
     full_path = File.join(dir, f)
 
@@ -70,7 +61,7 @@ def generate_comment(dir, files, initial_message: true)
 
   projects.compact!
 
-  markdown_body = "#{PREAMBLE_HEADER}\n\n#{get_header(initial_message)}\n\n"
+  markdown_body = FOUND_PROJECT_FILES_HEADER
 
   projects_without_valid_extensions = projects.reject { |p| ALLOWED_EXTENSIONS.include? File.extname(p.relative_path) }
 
@@ -101,10 +92,6 @@ def generate_comment(dir, files, initial_message: true)
 end
 
 def review_project(project)
-  yaml = project.read_yaml
-
-  warn "project YAML: '#{yaml}'"
-
   validation_errors = SchemaValidator.validate(project)
 
   return { project:, kind: 'validation', validation_errors: } if validation_errors.any?
@@ -136,8 +123,6 @@ def repository_check(project)
   # TODO: cleanup the GITHUB_TOKEN setting once this is decoupled from the environment variable
   result = GitHubRepositoryActiveCheck.run(project)
 
-  warn "repository_check returned result: #{result.inspect}"
-
   if result[:rate_limited]
     # logger.info 'This script is currently rate-limited by the GitHub API'
     # logger.info 'Marking as inconclusive to indicate that no further work will be done here'
@@ -157,8 +142,6 @@ end
 
 def label_check(project)
   result = GitHubRepositoryLabelActiveCheck.run(project)
-
-  warn "label_check returned result: #{result.inspect}"
 
   if result[:rate_limited]
     # logger.info 'This script is currently rate-limited by the GitHub API'
@@ -198,44 +181,6 @@ def label_check(project)
   nil
 end
 
-def find_existing_comment(client, repo, pull_request_number)
-  Object.const_set :PullRequestComments, client.parse(<<-GRAPHQL)
-    query ($owner: String!, $name: String!, $number: Int!) {
-      repository(owner: $owner, name: $name) {
-        pullRequest(number: $number) {
-          comments(first: 50) {
-            nodes {
-              id
-              body
-              author {
-                login
-                __typename
-              }
-            }
-          }
-        }
-      }
-    }
-  GRAPHQL
-
-  owner, name = repo.split('/')
-
-  variables = { owner:, name:, number: pull_request_number }
-
-  response = client.query(:PullRequestCommentsQuery, variables:)
-
-  pull_request = response.data.repository.pull_request
-  comments = pull_request.comments
-
-  return nil unless comments.nodes.any?
-
-  first_comment = comments.nodes.find { |node| node.author.login == 'shiftbot' && node.author.__typename == 'User' && node.body.include?(PREAMBLE_HEADER) }
-
-  return nil unless first_comment
-
-  first_comment.id
-end
-
 def valid_url?(url)
   uri = URI.parse(url)
   uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
@@ -243,32 +188,12 @@ rescue URI::InvalidURIError
   false
 end
 
-def create_client
-  http = GraphQL::Client::HTTP.new('https://api.github.com/graphql') do
-    def headers(_context)
-      {
-        'User-Agent': 'up-for-grabs-graphql-label-queries',
-        Authorization: "bearer #{ENV.fetch('GITHUB_TOKEN', 'unknown')}"
-      }
-    end
-  end
-
-  schema = GraphQL::Client.load_schema(http)
-
-  GraphQL::Client.new(schema:, execute: http)
-end
-
-start = Time.now
-
 head_sha = ENV.fetch('HEAD_SHA', nil)
 base_sha = ENV.fetch('BASE_SHA', nil)
 git_remote_url = ENV.fetch('GIT_REMOTE_URL', nil)
 dir = ENV.fetch('GITHUB_WORKSPACE', nil)
-pull_request_number = ENV.fetch('PULL_REQUEST_NUMBER', nil)
 
 range = "#{base_sha}...#{head_sha}"
-
-warn "Inspecting projects files that have changed for '#{range}' at '#{dir}' and remote '#{git_remote_url}'"
 
 if git_remote_url
   # fetching the fork repository so that our commits are in this repository
@@ -278,8 +203,8 @@ end
 
 result = run "git -C '#{dir}' diff #{range} --name-only -- _data/projects/"
 unless result[:exit_code].zero?
-  warn "Unable to compute diff range: #{range}..."
-  warn "stderr: #{result[:stderr]}"
+  puts 'A problem occurred when reading the git directory'
+  return
 end
 
 raw_files = result[:stdout].split("\n")
@@ -287,35 +212,18 @@ raw_files = result[:stdout].split("\n")
 files = raw_files.map(&:chomp)
 
 if files.empty?
-  warn 'No project files have been included in this PR...'
+  puts SKIP_PULL_REQUEST_MESSAGE
   return
 end
 
 result = run "git -C '#{dir}' checkout #{head_sha} --force"
 unless result[:exit_code].zero?
-  warn "Unable to checkout HEAD commit: #{head_sha}..."
-  warn "stderr: #{result[:stderr]}"
+  puts 'A problem occurred when trying to load this commit'
+  return
 end
 
-warn "Found files in this PR to process: '#{files}'"
+markdown_body = generate_review_comment(dir, files)
 
-markdown_body = generate_comment(dir, files, initial_message: true)
-
-warn "Comment to submit: #{markdown_body}"
-
-client = create_client
-
-existing_comment_id = find_existing_comment(client, 'up-for-grabs/up-for-grabs.net', pull_request_number)
-
-if existing_comment_id
-  warn "TODO: update comment #{existing_comment_id}"
-else
-  warn 'TODO: create new comment'
-end
-
-finish = Time.now
-delta = finish - start
-
-warn "Operation took #{delta}s"
+puts markdown_body
 
 exit 0
