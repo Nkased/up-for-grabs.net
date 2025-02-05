@@ -5,8 +5,8 @@ on:
     inputs:
       apply-changes:
         description: 'Whether workflow should generate a pull request for these changes'
-        required: false
-        default: '1'
+        required: true
+        default: '13'
 
 name: Cleanup stale projects
 jobs:
@@ -19,7 +19,7 @@ jobs:
       - name: Setup Ruby
         uses: ruby/setup-ruby@55283cc23133118229fd3f97f9336ee23a179fcf
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.0'
           bundler-cache: true
           cache-version: 0
       - name: Run script to cleanup inactive projects
